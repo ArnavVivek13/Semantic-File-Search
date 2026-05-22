@@ -1,5 +1,7 @@
 #My Files
 Docs/
+*.db
+*.index
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

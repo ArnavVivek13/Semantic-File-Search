@@ -1,117 +1,250 @@
-import pymupdf
 from pathlib import Path
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 import sqlite3
 import time
 import concurrent.futures
 import os
-import uuid
+import pymupdf
+
+from pdf_extractor import pdf_extractor, txt_extractor, docx_extractor
+from image_extractor import img_extractor
+
+# -------------------------------------------------
+# START TIMER
+# -------------------------------------------------
 
 t1 = time.time()
+
+# -------------------------------------------------
+# ROOT FOLDER
+# -------------------------------------------------
+
 folder_path = Path.home()
 
-# Text splitter
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=100
-)
+SKIP_DIRS = {
+    "node_modules",
+    ".git",
+    "venv",
+    "__pycache__",
+    "AppData",
+    "cache",
+    "Caches",
+    "drawable",
+    "mipmap"
+}
 
-def process_pdf(pdf_file):
-    try:
-        results = []
-        doc = pymupdf.open(pdf_file)
+BAD_IMAGE_KEYWORDS = {
+    "icon",
+    "logo",
+    "sprite",
+    "btn",
+    "button",
+    "background",
+    "bg",
+    "thumbnail",
+    "thumb",
+    "favicon",
+    "notification",
+    "checkbox",
+    "radio",
+    "spinner",
+    "abc_",
+    "mtrl"
+}
 
-        # Skip empty PDFs
-        if doc.page_count == 0:
-            print(f"Skipping PDF with 0 pages: {pdf_file.name}")
-            doc.close()
-            return []
+# -------------------------------------------------
+# EXTRACTOR REGISTRY
+# -------------------------------------------------
 
-        print(f"Processing: {pdf_file.name}")
-        file_name = pdf_file.name
-        file_location = str(pdf_file.resolve())
-        folder_name = pdf_file.parent.name
+CPU_EXTRACTORS = {
+    ".pdf": pdf_extractor,
+    ".txt": txt_extractor,
+    ".docx": docx_extractor,
+}
 
-        for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            text = page.get_text().strip()
+GPU_EXTRACTORS = {
+    ".png": img_extractor,
+    ".jpg": img_extractor,
+    ".jpeg": img_extractor,
+}
 
-            if not text:
-                continue
+ALL_EXTRACTORS = {
+    **CPU_EXTRACTORS,
+    **GPU_EXTRACTORS
+}
 
-            # --------------------------------
-            # CHUNK PAGE TEXT
-            # --------------------------------
-            chunks = splitter.split_text(text)
-            for chunk_num, chunk in enumerate(chunks):
-                # --------------------------------
-                # METADATA ENRICHMENT
-                # --------------------------------
-                rich_text = f"""
-                Filename: {file_name}
-                Folder: {folder_name}
-                File Path: {file_location}
-                Page Number: {page_num}
-                Chunk Number: {chunk_num}
-                Content:
-                {chunk}
-                """
-                unique_id = uuid.uuid4()
-                faiss_id = unique_id.int & ((1 << 63) - 1)
-                results.append((
-                            file_name, # 0
-                            file_location, # 1
-                            page_num, # 2
-                            chunk_num, # 3
-                            faiss_id, # 4
-                            rich_text # 5
-                        ))
+# -------------------------------------------------
+# DISPATCHER
+# -------------------------------------------------
 
-        doc.close()
-        return results
+def match_processing(file_path):
 
-    except Exception as e:
-        print(f"Failed: {pdf_file.name} -> {e}")
+    suffix = file_path.suffix.lower()
+
+    extractor = ALL_EXTRACTORS.get(suffix)
+
+    if extractor is None:
         return []
+
+    return extractor(file_path)
+
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
 
 if __name__ == "__main__":
 
-    pdf_files = [] # Stores paths of all the pdfs for now
+    files = []
 
-    for pdf_file in folder_path.rglob("*.pdf"):
+    # -------------------------------------------------
+    # COLLECT FILES
+    # -------------------------------------------------
 
-        # Skip empty files
-        if pdf_file.stat().st_size == 0:
-            print(f"Skipping empty file: {pdf_file.name}")
-            continue
+    for file in folder_path.rglob("*"):
 
-        pdf_files.append(pdf_file)
+        try:
+
+            if not file.is_file():
+                continue
+
+            suffix = file.suffix.lower()
+
+            # -------------------------------------------------
+            # SKIP DIRECTORIES
+            # -------------------------------------------------
+
+            if any(part in SKIP_DIRS for part in file.parts):
+                continue
+
+            # -------------------------------------------------
+            # SKIP BAD IMAGE FILENAMES
+            # -------------------------------------------------
+
+            if suffix in GPU_EXTRACTORS:
+
+                file_name_lower = file.name.lower()
+
+                if any(keyword in file_name_lower for keyword in BAD_IMAGE_KEYWORDS):
+                    print(f"Skipping junk image: {file.name}")
+                    continue
+
+            if suffix not in ALL_EXTRACTORS:
+                continue
+
+            # Skip empty files
+            if file.stat().st_size == 0:
+                print(f"Skipping empty file: {file.name}")
+                continue
+
+            files.append(file)
+
+        except Exception as e:
+
+            print(f"Failed collecting {file} -> {e}")
+
+    print(f"Total files found: {len(files)}")
+
+    # -------------------------------------------------
+    # SPLIT FILES
+    # -------------------------------------------------
+
+    cpu_files = []
+    gpu_files = []
+
+    for file in files:
+
+        suffix = file.suffix.lower()
+
+        if suffix in CPU_EXTRACTORS:
+            cpu_files.append(file)
+
+        elif suffix in GPU_EXTRACTORS:
+            gpu_files.append(file)
+
+    print(f"CPU files: {len(cpu_files)}")
+
+    print(f"GPU files: {len(gpu_files)}")
+
+    # -------------------------------------------------
+    # RESULTS
+    # -------------------------------------------------
 
     all_results = []
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+    # -------------------------------------------------
+    # CPU MULTIPROCESSING
+    # -------------------------------------------------
+
+    print("\nStarting CPU extraction...\n")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max(2, os.cpu_count() // 2)) as executor:
 
         futures = []
 
-        for pdf_file in pdf_files:
-            future = executor.submit(process_pdf, pdf_file)
+        for file in cpu_files:
+
+            future = executor.submit(
+                match_processing,
+                file
+            )
+
             futures.append(future)
 
         for future in concurrent.futures.as_completed(futures):
 
-            result = future.result()
+            try:
+
+                result = future.result()
+
+                if result:
+                    all_results.extend(result)
+
+            except Exception as e:
+
+                print(f"CPU worker failed -> {e}")
+
+    # -------------------------------------------------
+    # GPU / OLLAMA SEQUENTIAL
+    # -------------------------------------------------
+
+    print("\nStarting GPU extraction...\n")
+
+    for file in gpu_files:
+
+        try:
+
+            result = match_processing(file)
 
             if result:
                 all_results.extend(result)
 
-    # SQLite connection
+        except Exception as e:
+
+            print(f"GPU extraction failed -> {e}")
+
+    # -------------------------------------------------
+    # CHECK EMPTY
+    # -------------------------------------------------
+
+    if not all_results:
+
+        print("No results extracted.")
+
+        exit()
+
+    # -------------------------------------------------
+    # SQLITE
+    # -------------------------------------------------
+
     conn = sqlite3.connect("Semantic_index.db")
 
     c = conn.cursor()
 
-    # Create table
+    # -------------------------------------------------
+    # CREATE TABLE
+    # -------------------------------------------------
+
     c.execute("""
-    CREATE TABLE IF NOT EXISTS PDF_store (
+    CREATE TABLE IF NOT EXISTS File_store (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         File_name TEXT,
         File_location TEXT,
@@ -121,13 +254,36 @@ if __name__ == "__main__":
     )
     """)
 
+    # -------------------------------------------------
+    # CREATE INDEX
+    # -------------------------------------------------
+
+    c.execute("""
+    CREATE INDEX IF NOT EXISTS idx_faiss
+    ON File_store(FAISS_idx)
+    """)
+
+    # -------------------------------------------------
+    # PREPARE ROWS
+    # -------------------------------------------------
+
     db_rows = [
-        (r[0], r[1], r[2], r[3], r[4])
+        (
+            r[0], # File_name
+            r[1], # File_location
+            r[2], # Page_number
+            r[3], # Chunk_number
+            r[4]  # FAISS_idx
+        )
         for r in all_results
     ]
 
+    # -------------------------------------------------
+    # INSERT
+    # -------------------------------------------------
+
     c.executemany("""
-    INSERT INTO PDF_store (
+    INSERT INTO File_store (
         File_name,
         File_location,
         Page_number,
@@ -138,24 +294,43 @@ if __name__ == "__main__":
     """, db_rows)
 
     conn.commit()
+
     conn.close()
 
     t2 = time.time()
-    print(f"Finished adding the files to SQLite Database in {t2 - t1} seconds")
+
+    print(
+        f"\nFinished SQLite insertion in {t2 - t1:.2f} seconds"
+    )
+
+    # -------------------------------------------------
+    # EMBEDDINGS
+    # -------------------------------------------------
+
+    print("\nStarting embeddings...\n")
 
     from FAISS import encode_text, create_index
+
     rich_texts = [r[5] for r in all_results]
-
     ids = [r[4] for r in all_results]
-
     vectors = encode_text(rich_texts)
-
     t3 = time.time()
+    print(
+        f"\nFinished embeddings in {t3 - t2:.2f} seconds"
+    )
 
-    print(f"Finished encoding the rich texts in {t3-t2} seconds")
-
+    # -------------------------------------------------
+    # FAISS
+    # -------------------------------------------------
+    print("\nCreating FAISS index...\n")
     index = create_index(vectors, ids)
-
     t4 = time.time()
-
-    print(f"Finished creating FAISS Index in {t4-t3} seconds")
+    print(
+        f"\nFinished FAISS indexing in {t4 - t3:.2f} seconds"
+    )
+    # -------------------------------------------------
+    # TOTAL
+    # -------------------------------------------------
+    print(
+        f"\nTOTAL TIME: {t4 - t1:.2f} seconds"
+    )

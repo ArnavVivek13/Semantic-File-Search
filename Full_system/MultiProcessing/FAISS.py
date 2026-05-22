@@ -77,7 +77,7 @@ def search_index(query):
 
         c.execute("""
         SELECT *
-        FROM PDF_store
+        FROM File_store
         WHERE FAISS_idx = ?
         """, (faiss_idx,))
 
